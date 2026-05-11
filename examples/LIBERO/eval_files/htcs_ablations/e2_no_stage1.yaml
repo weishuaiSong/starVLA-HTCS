@@ -1,0 +1,19 @@
+# E2 — Ablate Stage 1 (codec-based selection).
+#
+# Drop the codec selector entirely; feed dense ViT patches (mean-pooled to
+# the same N_kept count) directly into Stage 2. Measures the contribution
+# of codec-aware sparsification.
+#
+# Inherit + override the main HTCS YAML.
+
+_base_: ../../train_files/starvla_htcs_libero.yaml
+
+run_id: htcs_e2_no_stage1
+wandb_project: starVLA_HTCS_ablation
+
+framework:
+  name: HTCS
+  stage1:
+    keep_ratio: 1.0                                    # keep everything → effectively no selection
+    disable_codec_saliency: true                       # TODO(htcs): plumb this flag through HTCS.__init__
+  # All other framework fields inherit from the base config.
