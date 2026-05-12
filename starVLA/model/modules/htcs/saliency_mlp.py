@@ -1,27 +1,33 @@
-"""Stage-1 saliency MLP.
+"""Stage-1 saliency MLP (direction-aware, 5-output).
 
-Maps a pooled language embedding to two positive scalar weights (alpha, beta)
-that modulate the codec saliency formula::
+Maps a pooled language embedding to FIVE outputs that modulate the codec
+saliency formula (impl doc §3.1, D12)::
 
-    s = alpha(l) * ||MV|| + beta(l) * |Residual|
+    s = alpha(l) * ||MV||_n + gamma(l) * (MV . v_tgt(l))_n + beta(l) * |Y-128|_n
+
+Outputs:
+    alpha, beta, gamma : (B,)   non-negative scalars (Softplus)
+    v_tgt              : (B, 2) unit vector — task-expected motion direction
 
 This is the *parameter-level* leg of HTCS hierarchical language conditioning.
-
-Reference: HTCS impl doc §3.1.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class SaliencyMLP(nn.Module):
-    """语言 embedding → (alpha, beta), 调制 codec saliency 公式."""
+    """语言 embedding → (alpha, beta, gamma, v_tgt), 调制 codec saliency 公式."""
 
     def __init__(self, d_text: int, hidden: int = 256):
         super().__init__()
-        # TODO(htcs): two-layer MLP, output dim 2, Softplus to guarantee positivity.
-        #   Linear(d_text, hidden) -> GELU -> Linear(hidden, 2) -> Softplus
-        raise NotImplementedError
+        # 5 outputs: alpha, beta, gamma, v_x, v_y
+        self.net = nn.Sequential(
+            nn.Linear(d_text, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 5),
+        )
 
     def forward(self, lang_emb: torch.Tensor):
         """
@@ -29,9 +35,17 @@ class SaliencyMLP(nn.Module):
             lang_emb: (B, L_text, d_text) — token-level language embeddings.
 
         Returns:
-            alpha, beta: each shaped (B, 1, 1, 1) for broadcasting against
-            saliency maps of shape (B, T, G, G).
+            alpha: (B,)   non-negative — weights ||MV||
+            beta:  (B,)   non-negative — weights |Y-128|
+            gamma: (B,)   non-negative — weights (MV . v_tgt)
+            v_tgt: (B, 2) unit vector — task-expected motion direction
         """
-        # TODO(htcs): pool over L_text (mean), apply MLP, split last dim into 2,
-        # then reshape both to (B, 1, 1, 1) for broadcasting.
-        raise NotImplementedError
+        out = self.net(lang_emb.mean(dim=1))            # (B, 5)
+        abg = F.softplus(out[..., 0:3])                 # (B, 3) non-negative
+        alpha = abg[..., 0]                             # (B,)
+        beta  = abg[..., 1]                             # (B,)
+        gamma = abg[..., 2]                             # (B,)
+        v_raw = out[..., 3:5]                           # (B, 2)
+        # Unit-normalise; +1e-6 avoids division-by-zero on all-zero language.
+        v_tgt = v_raw / (v_raw.norm(dim=-1, keepdim=True) + 1e-6)
+        return alpha, beta, gamma, v_tgt

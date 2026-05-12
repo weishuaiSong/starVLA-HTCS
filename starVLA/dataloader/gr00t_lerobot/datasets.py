@@ -633,6 +633,23 @@ class LeRobotSingleDataset(Dataset):
 
         print(f"Initialized dataset {self.dataset_name} with {embodiment_tag}")
 
+        # HTCS hook (impl doc §2.3): load codec.parquet alongside each example
+        # iff the YAML enabled it. Path scheme is shared with codec_preprocess.py:
+        #   <dataset_path>/htcs_codec/episode_{trajectory_id:06d}.parquet
+        self._htcs_codec_loader = None
+        self._htcs_codec_dir = self._dataset_path / "htcs_codec"
+        self._htcs_history_len = 0
+        if self.data_cfg is not None and bool(self.data_cfg.get("enable_htcs_codec", False)):
+            from starVLA.dataloader.gr00t_lerobot.htcs_codec_transform import HTCSCodecLoader
+            self._htcs_history_len = int(self.data_cfg.get("history_len", 16))
+            self._htcs_codec_loader = HTCSCodecLoader(
+                history_len=self._htcs_history_len,
+                grid_size=int(self.data_cfg.get("htcs_grid_size", 14)),
+            )
+            if not self._htcs_codec_dir.exists():
+                print(f"[HTCS] WARNING: enable_htcs_codec=True but "
+                      f"{self._htcs_codec_dir} does not exist. Run "
+                      f"examples/LIBERO/train_files/codec_preprocess.py first.")
 
         # Check if the dataset is valid
         self._check_integrity()
@@ -1366,7 +1383,18 @@ class LeRobotSingleDataset(Dataset):
         trajectory_id, base_index = self.all_steps[index]
         raw_data = self.get_step_data(trajectory_id, base_index)
         data = self.transforms(raw_data)
-        return self._pack_sample(data)
+        sample = self._pack_sample(data)
+
+        # HTCS hook: inject codec dict into sample['codec'] when enabled.
+        if self._htcs_codec_loader is not None:
+            T = self._htcs_history_len
+            # Raw (un-clamped) indices spanning the history window — negative
+            # values mark episode-start padding (D16 / impl doc §10.9).
+            raw_indices = [base_index - (T - 1 - i) for i in range(T)]
+            codec_parquet = self._htcs_codec_dir / f"episode_{int(trajectory_id):06d}.parquet"
+            sample = self._htcs_codec_loader(sample, codec_parquet, raw_indices)
+
+        return sample
 
     def _pack_sample(self, data: dict) -> dict:
         """Pack transformed modality data into training sample format."""
