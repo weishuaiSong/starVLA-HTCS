@@ -1,6 +1,10 @@
 #!/bin/bash
 # HTCS — LIBERO 4-suite joint training launcher.
 # Mirrors run_libero_train.sh but routes through the HTCS framework + YAML.
+#
+# Prereq: run codec preprocessing once per dataset before training, otherwise
+# HTCSCodecLoader will fail on the first __getitem__ call:
+#   python examples/LIBERO/train_files/codec_preprocess.py
 set -e
 
 Framework_name=HTCS

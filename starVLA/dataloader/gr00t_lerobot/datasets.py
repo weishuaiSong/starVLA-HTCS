@@ -639,6 +639,7 @@ class LeRobotSingleDataset(Dataset):
         self._htcs_codec_loader = None
         self._htcs_codec_dir = self._dataset_path / "htcs_codec"
         self._htcs_history_len = 0
+        self._htcs_primary_video_key = None
         if self.data_cfg is not None and bool(self.data_cfg.get("enable_htcs_codec", False)):
             from starVLA.dataloader.gr00t_lerobot.htcs_codec_transform import HTCSCodecLoader
             self._htcs_history_len = int(self.data_cfg.get("history_len", 16))
@@ -646,6 +647,13 @@ class LeRobotSingleDataset(Dataset):
                 history_len=self._htcs_history_len,
                 grid_size=int(self.data_cfg.get("htcs_grid_size", 14)),
             )
+            # Stage1 needs the same T-frame window as the codec parquet. The
+            # primary video key (modality_keys["video"][0]) is the one whose
+            # mp4 was fed to codec_preprocess.py; override its delta_indices so
+            # get_video returns (T, H, W, C) instead of (1, H, W, C).
+            self._htcs_primary_video_key = self.modality_keys["video"][0]
+            T = self._htcs_history_len
+            self._delta_indices[self._htcs_primary_video_key] = np.arange(-(T - 1), 1, dtype=np.int64)
             if not self._htcs_codec_dir.exists():
                 print(f"[HTCS] WARNING: enable_htcs_codec=True but "
                       f"{self._htcs_codec_dir} does not exist. Run "
@@ -1398,11 +1406,22 @@ class LeRobotSingleDataset(Dataset):
 
     def _pack_sample(self, data: dict) -> dict:
         """Pack transformed modality data into training sample format."""
-        step_images = []
-        for video_key in self.modality_keys["video"]:
-            image = data[video_key][0]
-            image = Image.fromarray(image).resize((224, 224))
-            step_images.append(image)
+        if self._htcs_codec_loader is not None:
+            # HTCS path: emit T primary-view frames as a temporal history
+            # (oldest → newest). Stage1 ViT and the codec saliency map share
+            # this same window; wrist view is ignored at Stage1.
+            primary_key = self._htcs_primary_video_key
+            frames = data[primary_key]
+            step_images = [
+                Image.fromarray(frames[t]).resize((224, 224))
+                for t in range(frames.shape[0])
+            ]
+        else:
+            step_images = []
+            for video_key in self.modality_keys["video"]:
+                image = data[video_key][0]
+                image = Image.fromarray(image).resize((224, 224))
+                step_images.append(image)
 
         language = data[self.modality_keys["language"][0]][0]
         action = []

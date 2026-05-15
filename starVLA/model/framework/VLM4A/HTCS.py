@@ -140,8 +140,12 @@ class HTCS(baseframework):
         instructions = [ex["lang"] for ex in examples]
 
         # 1. Language + current-frame embeddings via VLM.
+        # build_qwenvl_inputs expects List[List[PIL]] — one image list per
+        # sample. We pass just the newest frame (imgs[-1]) of the history
+        # window since the VLM only needs current visual grounding; the full
+        # T-frame history goes to Stage1 / Stage2 via _collate_history.
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
-            images=[imgs[-1] for imgs in batch_images],
+            images=[[imgs[-1]] for imgs in batch_images],
             instructions=instructions,
         )
         with torch.autocast("cuda", dtype=torch.bfloat16):

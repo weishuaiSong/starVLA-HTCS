@@ -22,7 +22,7 @@ framework:
     state_dim: 7
     action_horizon: 8
   aux_loss:
-    lambda_aux: 0.1
+    lambda_aux: 0.0                                    # action loss only — disable task classifier
     n_tasks: 40                                        # LIBERO 4 suites = 40 tasks
 
 datasets:
