@@ -410,7 +410,7 @@ class Stage2LangCompressor(nn.Module):
 4. `forward(examples: List[dict])` 对齐 starVLA 约定
 
 ```python
-"""HTCS Framework — Hierarchical Task-Conditioned Selection."""
+"""HTCS Framework — Hierarchical Task-Conditioned Saliency."""
 from dataclasses import dataclass, field
 from typing import List, Optional
 

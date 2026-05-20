@@ -1,4 +1,4 @@
-"""HTCS modules — Hierarchical Task-Conditioned Selection.
+"""HTCS modules — Hierarchical Task-Conditioned Saliency.
 
 Stage 1: codec-based saliency selection (parameter-level language conditioning).
 Stage 2: language-derived slot compression (structure-level conditioning).

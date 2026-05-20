@@ -22,15 +22,124 @@ Exposed API:
 from __future__ import annotations
 
 import logging
+from collections import deque
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+from PIL import Image
 
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.framework.share_tools import read_mode_config
 
 from deployment.model_server.policy_norm_processor import PolicyNormProcessor
+
+
+class _HTCSStatefulAdapter:
+    """Server-side state for HTCS inference.
+
+    The eval client (``model2libero_interface.py``) sends one fresh observation
+    per step with no temporal context, but HTCS needs:
+
+    * a T=16-frame primary-view image history (oldest -> newest), and
+    * a per-step codec window from a rolling HEVC encoder/decoder pair.
+
+    This adapter maintains both, resetting whenever ``example['lang']`` changes
+    -- which the eval client uses as the implicit episode boundary signal
+    (see ``ModelClient.step``: ``if task_description != self.task_description:
+    self.reset(...)``).
+
+    Single-environment assumption: each policy_server process handles one
+    rollout at a time (LIBERO eval launches one server per CUDA_VISIBLE_DEVICES).
+    Batched inference with mixed episodes would need one adapter per slot.
+
+    The adapter exposes only ``predict_action`` -- ``PolicyServerWrapper`` is
+    the only caller and treats the wrapped object as a duck-typed framework.
+    """
+
+    def __init__(
+        self,
+        framework,
+        history_len: int = 16,
+        grid_size: int = 14,
+        frame_h: int = 224,
+        frame_w: int = 224,
+    ) -> None:
+        from starVLA.model.modules.htcs.rolling_codec import RollingCodecEncoder
+
+        self._framework = framework
+        self.T = int(history_len)
+        self.G = int(grid_size)
+        self.H = int(frame_h)
+        self.W = int(frame_w)
+
+        self._image_buf: deque = deque(maxlen=self.T)
+        self._codec = RollingCodecEncoder(
+            history_len=self.T,
+            grid_size=self.G,
+            frame_h=self.H,
+            frame_w=self.W,
+        )
+        self._codec.reset()
+        self._last_lang: Optional[str] = None
+
+    def _reset(self, lang: Optional[str]) -> None:
+        self._image_buf.clear()
+        self._codec.reset()
+        self._last_lang = lang
+
+    def _build_t_frame_history(self) -> List[Image.Image]:
+        """Pad the image deque to T frames by repeating the oldest entry.
+
+        Mirrors training-side ``np.maximum(step_indices, 0)`` clamp in
+        ``LeRobotSingleDataset.get_video``: pre-episode-start indices reuse
+        frame 0. The codec side gets zero MV/residual + ``frame_valid=False``
+        at those slots, which is intentionally asymmetric -- visuals look like
+        a static first frame, codec saliency is dead.
+        """
+        actual = list(self._image_buf)
+        if len(actual) == 0:
+            raise RuntimeError("HTCS adapter: image buffer empty at predict_action")
+        if len(actual) < self.T:
+            actual = [actual[0]] * (self.T - len(actual)) + actual
+        return actual
+
+    def predict_action(self, examples: List[dict], **kwargs) -> Dict[str, Any]:
+        """Augment each example with T-frame history + codec window, forward.
+
+        ``examples`` come from the eval client and contain
+        ``{"image": [primary_uint8_HWC, wrist_uint8_HWC], "lang": str, ...}``.
+        We only consume the primary view (index 0) -- wrist is discarded for
+        HTCS because Stage1's frozen ViT + codec saliency are wired to the
+        single view that ``codec_preprocess.py`` produced parquets for.
+        """
+        augmented: List[dict] = []
+        for ex in examples:
+            lang = ex.get("lang", None)
+            if lang != self._last_lang:
+                self._reset(lang)
+
+            raw_img = ex.get("image", None)
+            if raw_img is None:
+                raise KeyError("HTCS adapter: example missing 'image' field")
+            primary_np = np.asarray(raw_img[0] if isinstance(raw_img, (list, tuple)) else raw_img)
+            if primary_np.dtype != np.uint8:
+                primary_np = primary_np.astype(np.uint8)
+            # Eval client resizes to image_size (default 224x224); defend against
+            # callers that skip that step or use a different resolution.
+            if primary_np.shape[:2] != (self.H, self.W):
+                primary_pil_tmp = Image.fromarray(primary_np).resize((self.W, self.H))
+                primary_np = np.asarray(primary_pil_tmp, dtype=np.uint8)
+
+            self._codec.push(primary_np)
+            self._image_buf.append(Image.fromarray(primary_np))
+
+            new_ex = dict(ex)
+            new_ex["image"] = self._build_t_frame_history()
+            new_ex["codec"] = self._codec.get_window()
+            augmented.append(new_ex)
+
+        return self._framework.predict_action(examples=augmented, **kwargs)
 
 
 class PolicyServerWrapper:
@@ -50,11 +159,32 @@ class PolicyServerWrapper:
         if use_bf16:
             framework = framework.to(torch.bfloat16)
         framework = framework.to(device).eval()
-        self._framework = framework
 
         # Co-located metadata.
         model_cfg, _ = read_mode_config(self._ckpt_path)
         self._model_cfg = model_cfg
+
+        # HTCS needs server-side rolling state (image history + codec encoder)
+        # because the eval client only sends a single current frame per step.
+        # We wrap the framework in a stateful adapter so PolicyServerWrapper's
+        # predict_action path stays model-agnostic.
+        framework_name = model_cfg.get("framework", {}).get("name", "")
+        if framework_name == "HTCS":
+            history_len = int(
+                model_cfg.get("datasets", {}).get("vla_data", {}).get("history_len", 16)
+            )
+            grid_size = int(
+                model_cfg.get("framework", {}).get("stage1", {}).get("grid_size", 14)
+            )
+            logging.info(
+                "PolicyServerWrapper: detected HTCS ckpt; wrapping framework "
+                "with _HTCSStatefulAdapter (T=%d, G=%d)",
+                history_len, grid_size,
+            )
+            framework = _HTCSStatefulAdapter(
+                framework, history_len=history_len, grid_size=grid_size,
+            )
+        self._framework = framework
 
         # action_chunk_size = future_action_window_size + 1 (matches old client).
         action_model_cfg = model_cfg["framework"]["action_model"]

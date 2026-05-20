@@ -25,12 +25,17 @@ that offline preprocessing and the online ``RollingCodecEncoder`` stay
 bit-identical — train/eval symmetry (impl doc §7.2.1).
 """
 
+import argparse
+import os
 import re
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import av
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from starVLA.model.modules.htcs.codec_config import HTCS_CODEC_CONFIG
 
@@ -165,7 +170,17 @@ def _episode_id_from_video_name(video_name: str) -> int:
     return int(m.group(1))
 
 
-def process_suite(suite_root: Path) -> None:
+def _process_one(args: tuple) -> tuple:
+    """Pickle-friendly worker — extracts one episode. Returns (status, video_str)."""
+    video, out_parquet = args
+    try:
+        extract_codec_for_episode(Path(video), Path(out_parquet))
+        return ("done", str(video))
+    except Exception as e:
+        return (f"error: {e}", str(video))
+
+
+def process_suite(suite_root: Path, num_workers: int = 1) -> None:
     """Walk ``<suite_root>/videos`` for the primary view and extract codec parquets."""
     videos_root = suite_root / "videos"
     if not videos_root.exists():
@@ -174,7 +189,7 @@ def process_suite(suite_root: Path) -> None:
     out_root = suite_root / "htcs_codec"
     out_root.mkdir(parents=True, exist_ok=True)
 
-    n_done = 0
+    todo: list[tuple[Path, Path]] = []
     n_skip = 0
     for video in videos_root.rglob("*.mp4"):
         # Primary view only — wrist cam is not needed for HTCS Stage1.
@@ -185,18 +200,56 @@ def process_suite(suite_root: Path) -> None:
         if out_parquet.exists():
             n_skip += 1
             continue
-        print(f"[codec] {video} -> {out_parquet.name}")
-        extract_codec_for_episode(video, out_parquet)
-        n_done += 1
-    print(f"[codec] {suite_root.name}: done {n_done}, skipped {n_skip}")
+        todo.append((video, out_parquet))
+
+    if not todo:
+        print(f"[codec] {suite_root.name}: nothing to do (skipped {n_skip})")
+        return
+
+    print(f"[codec] {suite_root.name}: {len(todo)} episodes to process "
+          f"(skipped {n_skip}, workers={num_workers})")
+
+    t0 = time.time()
+    if num_workers <= 1:
+        # Serial path — easier to debug (full traceback on hangs).
+        for video, out_parquet in tqdm(todo, desc=suite_root.name):
+            extract_codec_for_episode(video, out_parquet)
+    else:
+        with ProcessPoolExecutor(max_workers=num_workers) as pool:
+            futures = [pool.submit(_process_one, (str(v), str(o))) for v, o in todo]
+            for fut in tqdm(as_completed(futures), total=len(futures), desc=suite_root.name):
+                status, video = fut.result()
+                if status != "done":
+                    print(f"[codec] FAILED {video}: {status}")
+
+    print(f"[codec] {suite_root.name}: done in {time.time() - t0:.1f}s")
 
 
 def main() -> None:
-    """Iterate all LIBERO suite videos and extract codec artifacts."""
-    data_root = Path("playground/Datasets/LEROBOT_LIBERO_DATA")
-    suites = ["libero_spatial", "libero_object", "libero_goal", "libero_10"]
-    for suite in suites:
-        process_suite(data_root / f"{suite}_no_noops_1.0.0_lerobot")
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default="playground/Datasets/LEROBOT_LIBERO_DATA",
+        help="LeRobot LIBERO root containing libero_*_no_noops_1.0.0_lerobot/.",
+    )
+    parser.add_argument(
+        "--suites",
+        nargs="+",
+        default=["libero_spatial", "libero_object", "libero_goal", "libero_10"],
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=max(1, (os.cpu_count() or 2) // 2),
+        help="Parallel episodes. Default: half of os.cpu_count(). Set to 1 to "
+             "debug a hang (serial run prints tqdm progress + full tracebacks).",
+    )
+    args = parser.parse_args()
+
+    data_root = Path(args.data_root)
+    for suite in args.suites:
+        process_suite(data_root / f"{suite}_no_noops_1.0.0_lerobot", num_workers=args.num_workers)
 
 
 if __name__ == "__main__":

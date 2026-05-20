@@ -2,7 +2,7 @@
 
 > 这份 README 用来快速带新协作者 / 新 Claude session 进入本 fork 的工作上下文。读完这份就足以开始动手写代码。
 >
-> **本 fork 用途**：基于 [starVLA](https://github.com/starVLA/starVLA) 实现 **HTCS (Hierarchical Task-Conditioned Selection)** —— 一种基于 codec 的双 granularity 语言条件化历史压缩 VLA 方法。
+> **本 fork 用途**：基于 [starVLA](https://github.com/starVLA/starVLA) 实现 **HTCS (Hierarchical Task-Conditioned Saliency)** —— 一种基于 codec 的双 granularity 语言条件化历史压缩 VLA 方法。
 >
 > **代码主体仍是 starVLA**，HTCS 只是其上多注册的一个 framework，参考 starVLA `examples/LIBERO/` 的现有结构对应改造即可。
 

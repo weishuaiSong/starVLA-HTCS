@@ -1,4 +1,4 @@
-"""HTCS Framework — Hierarchical Task-Conditioned Selection.
+"""HTCS Framework — Hierarchical Task-Conditioned Saliency.
 
 Top-level VLA framework that wires Qwen3-VL backbone + Stage1 codec selector +
 Stage2 language compressor + fusion + (MLP or DiT) action head + auxiliary
@@ -66,7 +66,7 @@ class HTCSDefaultConfig:
 
 @FRAMEWORK_REGISTRY.register("HTCS")
 class HTCS(baseframework):
-    """Hierarchical Task-Conditioned Selection VLA framework."""
+    """Hierarchical Task-Conditioned Saliency VLA framework."""
 
     def __init__(self, config: Optional[dict] = None, **kwargs):
         super().__init__()
