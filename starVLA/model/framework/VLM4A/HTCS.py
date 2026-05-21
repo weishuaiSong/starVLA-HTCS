@@ -25,6 +25,7 @@ from starVLA.model.modules.htcs import (
     Stage2LangCompressor,
     apply_3d_rope,
 )
+from starVLA.model.modules.htcs.vision_adapters import build_vision_adapter
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils import initialize_overwatch
@@ -84,30 +85,41 @@ class HTCS(baseframework):
         if hasattr(self.config.framework.action_model, "action_hidden_dim"):
             self.config.framework.action_model.action_hidden_dim = d_vlm
 
-        # ---------- Stage 1 ----------
-        # Borrow the visual tower and freeze it. Stage1CodecSelector stores it
-        # as a plain attribute (not a submodule) to avoid double registration.
-        vit = self.qwen_vl_interface.model.visual
-        for p in vit.parameters():
-            p.requires_grad = False
-        if hasattr(vit, "gradient_checkpointing_disable"):
-            # Frozen ViT shouldn't pay re-compute cost (impl doc §10.5).
-            try:
-                vit.gradient_checkpointing_disable()
-            except Exception:
-                pass
+        # ---------- Vision adapter ----------
+        # Backbone-specific ViT wrapper. Picks the right adapter
+        # automatically from the HF model (Qwen3.5 / Qwen3-VL / SigLIP /
+        # ...) via ``can_handle`` detection; an explicit override is
+        # available at ``framework.vision_adapter`` if the user wants to
+        # pin one. The adapter owns model-specific normalisation, packing
+        # and the ``last_hidden_state`` vs. ``pooler_output`` decision —
+        # Stage1 just calls ``adapter.encode(frames)``.
+        adapter_override = getattr(
+            self.config.framework, "vision_adapter", None,
+        )
+        self.vision_adapter = build_vision_adapter(
+            self.qwen_vl_interface.model,
+            override=adapter_override,
+            grid_size=int(self.config.framework.stage1.grid_size),
+        )
+        # The adapter freezes its own ViT in __init__ (default), but
+        # double-freeze defensively in case a subclass forgets.
+        self.vision_adapter.freeze()
+        # Sync the actual patch dim back into the OmegaConf tree so any
+        # downstream telemetry / saved-config inspection matches reality
+        # even if the yaml shipped with a stale value.
+        self.config.framework.stage2.d_patch = self.vision_adapter.d_patch
 
+        # ---------- Stage 1 ----------
         self.stage1 = Stage1CodecSelector(
-            vit_encoder=vit,
+            vision_adapter=self.vision_adapter,
             d_text=d_text,
             keep_ratio=self.config.framework.stage1.keep_ratio,
-            grid_size=self.config.framework.stage1.grid_size,
         )
 
         # ---------- Stage 2 ----------
         self.stage2 = Stage2LangCompressor(
             d_text=d_text,
-            d_patch=int(self.config.framework.stage2.d_patch),
+            d_patch=self.vision_adapter.d_patch,
             d_vlm=d_vlm,
             K=int(self.config.framework.stage2.K),
             n_heads=int(self.config.framework.stage2.n_heads),
@@ -245,35 +257,14 @@ class HTCS(baseframework):
         }
 
     def _collate_history(self, batch_images: List[List]) -> torch.Tensor:
-        """Convert List[List[PIL.Image]] → (B, T, 3, 224, 224) bf16 tensor.
+        """Convert List[List[PIL.Image]] → backbone-specific (B, T, 3, H, W) tensor.
 
-        Uses SigLIP / CLIP normalisation to match the frozen ViT's input
-        distribution; falls back to ImageFromArray when given numpy arrays.
+        Delegates normalisation / resize to the active vision adapter so
+        each backbone (Qwen3.5 / Qwen3-VL / SigLIP / …) sees the input
+        distribution it was trained on. The previous CLIP-mean/std
+        hardcode used to silently shift inputs for any non-CLIP ViT.
         """
-        from PIL import Image as _PIL
-        from torchvision import transforms
-
-        device = next(self.parameters()).device
-
-        preprocess = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.48145466, 0.4578275, 0.40821073],
-                std=[0.26862954, 0.26130258, 0.27577711],
-            ),
-        ])
-
-        B = len(batch_images)
-        T = len(batch_images[0])
-        out = torch.zeros(B, T, 3, 224, 224, dtype=torch.float32)
-        for b, frames in enumerate(batch_images):
-            for t, img in enumerate(frames):
-                if not isinstance(img, _PIL.Image.Image):
-                    img = _PIL.fromarray(np.asarray(img, dtype=np.uint8))
-                out[b, t] = preprocess(img)
-
-        return out.to(device=device, dtype=torch.bfloat16)
+        return self.vision_adapter.preprocess(batch_images)
 
 
 # ---------------------------------------------------------------------- #

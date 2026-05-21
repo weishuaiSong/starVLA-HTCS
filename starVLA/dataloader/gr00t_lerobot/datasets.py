@@ -2398,10 +2398,25 @@ class LeRobotMixtureDataset(Dataset):
                         break
                     index = random.randint(0, len(self) - 1)
                     
-                raw_data = dataset.get_step_data(trajectory_id, step)    
+                raw_data = dataset.get_step_data(trajectory_id, step)
                 data = dataset.transforms(raw_data)
                 sample = dataset._pack_sample(data)
-                
+
+                # HTCS hook: mirror LeRobotSingleDataset.__getitem__ — the
+                # mixture path bypasses SingleDataset.__getitem__, so the
+                # codec dict has to be injected here too, otherwise the HTCS
+                # forward fails with KeyError('codec').
+                if dataset._htcs_codec_loader is not None:
+                    T = dataset._htcs_history_len
+                    raw_indices = [step - (T - 1 - i) for i in range(T)]
+                    codec_parquet = (
+                        dataset._htcs_codec_dir
+                        / f"episode_{int(trajectory_id):06d}.parquet"
+                    )
+                    sample = dataset._htcs_codec_loader(
+                        sample, codec_parquet, raw_indices,
+                    )
+
                 return sample
                 
             except Exception as e:

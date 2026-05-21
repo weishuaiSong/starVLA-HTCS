@@ -1,7 +1,9 @@
 run_id: htcs_libero_4suite
 run_root_dir: playground/Checkpoints
 seed: 42
+wandb_entity: your_wandb_entity
 wandb_project: starVLA_HTCS
+is_debug: false
 version_id: "0.1"
 
 framework:
@@ -9,13 +11,19 @@ framework:
   qwenvl:
     base_vlm: ./playground/Pretrained_models/Qwen3.5-0.8B
     attn_implementation: flash_attention_2
+  # vision_adapter: null  → auto-detect by inspecting hf_model structure;
+  # set to a registered short name (e.g. 'qwen3_5', 'qwen3_vl', 'siglip')
+  # to force a specific adapter when auto-detect can't or shouldn't pick.
+  vision_adapter: null
   stage1:
     keep_ratio: 0.20
-    grid_size: 14
+    grid_size: 14                                      # codec grid; adapter must agree
   stage2:
     K: 8
     n_heads: 4
-    d_patch: 1152                                      # SigLIP-Large output dim
+    # d_patch is auto-set from the chosen vision adapter at runtime.
+    # Leave 1152 as a fallback for adapters that may not override.
+    d_patch: 1152
   action_model:
     action_model_type: MLP                             # phase 1; switch to "DiT" later
     action_dim: 7
@@ -52,9 +60,13 @@ trainer:
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 3.0e-05
-  freeze_modules: 'qwen_vl_interface.model.visual'     # SigLIP ViT stays frozen
+  # The vision tower is already frozen by the active vision adapter
+  # (see HTCS.__init__ → adapter.freeze()); leaving this list empty
+  # avoids a brittle string-path freeze that would silently no-op when
+  # the backbone (and thus the visual-tower attribute path) changes.
+  freeze_modules: ''
   max_grad_norm: 1.0
-  weight_decay: 0.05
+  gradient_clipping: 1.0                              # accelerator.clip_grad_norm_ value used by _train_step
   logging_frequency: 100
   gradient_accumulation_steps: 1
   gradient_checkpointing: true
@@ -63,3 +75,4 @@ trainer:
     name: AdamW
     betas: [0.9, 0.95]
     eps: 1.0e-08
+    weight_decay: 0.05

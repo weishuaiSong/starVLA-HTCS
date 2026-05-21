@@ -42,7 +42,7 @@ class _HTCSStatefulAdapter:
     per step with no temporal context, but HTCS needs:
 
     * a T=16-frame primary-view image history (oldest -> newest), and
-    * a per-step codec window from a rolling HEVC encoder/decoder pair.
+    * a per-step codec window from a rolling H.264 encoder/decoder pair.
 
     This adapter maintains both, resetting whenever ``example['lang']`` changes
     -- which the eval client uses as the implicit episode boundary signal

@@ -5,7 +5,7 @@ without needing real Qwen3.5-VL weights or a websocket server.
 Usage:
     PYTHONPATH=. python examples/LIBERO/eval_files/test_htcs_inference_adapter.py
 
-Requires PyAV with HEVC (x265) — same dependency as codec_preprocess.py.
+Requires PyAV with H.264 (x264) — same dependency as codec_preprocess.py.
 """
 
 import numpy as np

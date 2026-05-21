@@ -1,4 +1,4 @@
-"""Streaming HEVC encoder/decoder for inference (M-online).
+"""Streaming H.264 encoder/decoder for inference (M-online).
 
 Maintains a persistent PyAV encoder + decoder pair so each rollout step
 pushes one RGB frame and gets that frame's (MV, residual, is_i_frame)
@@ -23,12 +23,17 @@ import numpy as np
 from .codec_config import HTCS_CODEC_CONFIG
 
 
+# Enum key for MV side-data on a decoded PyAV frame. Looking up the
+# string ``'MOTION_VECTORS'`` silently returns None on PyAV ≥10.
+_MV_SIDE_DATA_TYPE = av.sidedata.sidedata.Type.MOTION_VECTORS
+
+
 # ---------------------------------------------------------------------- #
 #  Per-frame extraction helpers (shared with codec_preprocess.py — both
 #  paths MUST stay identical or train/eval symmetry breaks).
 # ---------------------------------------------------------------------- #
 def extract_mv_grid(frame, grid_size: int = 14) -> np.ndarray:
-    """Aggregate decoded HEVC motion vectors onto a (grid_size, grid_size, 2) int8 grid."""
+    """Aggregate decoded H.264 motion vectors onto a (grid_size, grid_size, 2) int8 grid."""
     W, H = frame.width, frame.height
     cell_w = max(W // grid_size, 1)
     cell_h = max(H // grid_size, 1)
@@ -36,8 +41,9 @@ def extract_mv_grid(frame, grid_size: int = 14) -> np.ndarray:
     acc = np.zeros((grid_size, grid_size, 2), dtype=np.float32)
     cnt = np.zeros((grid_size, grid_size), dtype=np.int32)
 
-    if 'MOTION_VECTORS' in frame.side_data:
-        for mv in frame.side_data['MOTION_VECTORS']:
+    mv_block = frame.side_data.get(_MV_SIDE_DATA_TYPE)
+    if mv_block is not None:
+        for mv in mv_block:
             gx = min(int(mv.dst_x) // cell_w, grid_size - 1)
             gy = min(int(mv.dst_y) // cell_h, grid_size - 1)
             scale = max(int(mv.motion_scale), 1)
@@ -65,7 +71,7 @@ def extract_luma_residual_energy(frame, grid: int = 14) -> np.ndarray:
 #  Streaming encoder
 # ---------------------------------------------------------------------- #
 class RollingCodecEncoder:
-    """Online HEVC encoder + decoder pair for one camera view.
+    """Online H.264 encoder + decoder pair for one camera view.
 
     Usage:
         enc = RollingCodecEncoder(history_len=16, grid_size=14)
@@ -116,11 +122,11 @@ class RollingCodecEncoder:
             'preset':       cfg['preset'],
             'tune':         cfg['tune'],
             'g':            str(cfg['gop']),
-            'x265-params':  cfg['x265_params'],
+            'x264-params':  cfg['x264_params'],
         }
         # Stand-alone decoder so we can flip export_mvs on without touching
         # the encoder. extradata is copied lazily once available.
-        self._dec_ctx = av.codec.CodecContext.create('hevc', 'r')
+        self._dec_ctx = av.codec.CodecContext.create(cfg['decoder'], 'r')
         try:
             self._dec_ctx.export_mvs = True
         except AttributeError:

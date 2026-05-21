@@ -11,6 +11,12 @@ from .saliency_mlp import SaliencyMLP
 from .slot_attention import CompetitiveSlotAttention
 from .stage1_codec_selector import Stage1CodecSelector
 from .stage2_lang_compressor import Stage2LangCompressor
+from .vision_adapters import (
+    BaseVisionAdapter,
+    build_vision_adapter,
+    list_vision_adapters,
+    register_vision_adapter,
+)
 
 __all__ = [
     "HTCS_CODEC_CONFIG",
@@ -20,4 +26,8 @@ __all__ = [
     "CompetitiveSlotAttention",
     "Stage1CodecSelector",
     "Stage2LangCompressor",
+    "BaseVisionAdapter",
+    "build_vision_adapter",
+    "list_vision_adapters",
+    "register_vision_adapter",
 ]

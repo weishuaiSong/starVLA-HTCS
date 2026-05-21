@@ -46,6 +46,9 @@ class SaliencyMLP(nn.Module):
         beta  = abg[..., 1]                             # (B,)
         gamma = abg[..., 2]                             # (B,)
         v_raw = out[..., 3:5]                           # (B, 2)
-        # Unit-normalise; +1e-6 avoids division-by-zero on all-zero language.
-        v_tgt = v_raw / (v_raw.norm(dim=-1, keepdim=True) + 1e-6)
+        # Unit-normalise. Avoid ``v_raw.norm()`` whose gradient is
+        # ``v_raw / ||v_raw||`` and evaluates to NaN at zero. Use
+        # ``sqrt(sum + eps)`` so the gradient is well-defined everywhere.
+        v_norm = (v_raw.pow(2).sum(dim=-1, keepdim=True) + 1e-12).sqrt()
+        v_tgt = v_raw / v_norm.clamp_min(1e-6)
         return alpha, beta, gamma, v_tgt

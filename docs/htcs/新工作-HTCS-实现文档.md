@@ -31,7 +31,8 @@ class HTCS(baseframework):
 
 - **VLM**：从 `starVLA/model/modules/vlm/` 取——HTCS 用 `QWen3_5.py`（0.8B/2B/4B/9B 都支持），通过 `get_vlm_model(config)` 拿到
 - **Action Head**：从 `starVLA/model/modules/action_model/` 取——第一阶段 `MLP_ActionHeader`，第二阶段 `DiTActionHeader` 或 `LayerwiseFM_ActionHeader`，**不要自己写**
-- **HTCS 新模块**：只增加 `starVLA/model/modules/htcs/`（新目录），包含 Stage1/Stage2/SaliencyMLP/CompetitiveSlotAttention 四个文件
+- **Vision Adapter（关键抽象,backbone 替换不动 framework）**：`starVLA/model/modules/htcs/vision_adapters/` 下的 `BaseVisionAdapter` ABC + 一个 backbone 一份实现(`qwen3_5.py`,后续可加 `siglip.py` / `qwen3_vl.py` …)。Stage1 只调 `adapter.encode(frames) → (B, T, G*G, d_patch)`,backbone 差异(grid_thw / packing / mean-std / pre-merge vs post-merge)全藏在 adapter 里。`build_vision_adapter(hf_model, override=None)` 走 hybrid 自动检测(每个 adapter 自带 `can_handle`),yaml `framework.vision_adapter` 可显式覆盖。
+- **HTCS 新模块**：只增加 `starVLA/model/modules/htcs/`（新目录），包含 Stage1/Stage2/SaliencyMLP/CompetitiveSlotAttention 四个文件 + vision_adapters 子目录
 
 ### 0.3 数据与训练
 
@@ -83,11 +84,13 @@ class HTCS(baseframework):
 
 ### 2.1 离线脚本：`examples/LIBERO/train_files/codec_preprocess.py`
 
+> **修订**:实际实现已从 HEVC/libx265 切到 **H.264/libx264**。原因:FFmpeg 的 `export_mvs` 只支持 H.264/MPEG-2/MPEG-4/VP8/VP9 解码器,**不支持 HEVC**(实测 ffprobe 110 帧 HEVC 一个 `Motion vectors` side-data 都没有,只有 SEI)。此外重编码分辨率改为 **224×224**(对齐在线 `RollingCodecEncoder` 默认 + ViT 14×14 patch 网格 = 16px/cell 精确对齐 H.264 宏块,train/eval codec 分布一致)。
+
 ```python
 """
 对 LIBERO LeRobot 数据集做一次性 codec 提取：
 - 读取每个 episode 的 video.mp4
-- 用 PyAV 重新编码为 HEVC（GOP=8, preset=medium）
+- 用 PyAV 重新编码为 H.264 @ 224×224（GOP=8, preset=ultrafast, tune=zerolatency）
 - 提取 I-frame indices / P-frame MV / P-frame residual energy
 - 写回 episode 的 meta/codec.parquet
 """
@@ -96,22 +99,37 @@ import av
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from starVLA.model.modules.htcs.codec_config import HTCS_CODEC_CONFIG  # 离线/在线共享
 
-def extract_codec_for_episode(video_path: Path, gop_size: int = 8):
-    container_out_path = video_path.with_suffix(".hevc.mp4")
-    # 1. 重编码为 HEVC
+def extract_codec_for_episode(video_path: Path, target_size: int = 224):
+    cfg = HTCS_CODEC_CONFIG
+    container_out_path = video_path.with_suffix(".htcs.mp4")
+    # 1. 重编码为 H.264 @ 224(train/eval codec 分布对称必要条件)
     in_ctx = av.open(str(video_path))
     out_ctx = av.open(str(container_out_path), mode='w')
-    stream = out_ctx.add_stream('libx265', rate=30)
-    stream.options = {'preset': 'medium', 'g': str(gop_size), 'x265-params': 'log-level=error'}
+    stream = out_ctx.add_stream(cfg['codec'], rate=30)  # 'libx264'
+    stream.width = target_size; stream.height = target_size
+    stream.options = {
+        'preset': cfg['preset'], 'tune': cfg['tune'],
+        'g': str(cfg['gop']), 'x264-params': cfg['x264_params'],
+    }
 
-    frames = list(in_ctx.decode(video=0))
-    for f in frames:
-        out_ctx.mux(stream.encode(f))
-    out_ctx.mux(stream.encode())
+    pts = 0
+    for f in in_ctx.decode(video=0):
+        # 必须 reformat 到 224(否则源 256 会让 14×14 codec 网格与 ViT patch 错位)
+        # 也必须重建 frame 用 monotonic pts(否则源 PTS time_base=1/10240 会让
+        # libx264 把每隔一帧标 IDR,实测 110 帧出 55 个 keyframe)
+        rgb = f.reformat(width=target_size, height=target_size,
+                         format='rgb24').to_ndarray()
+        new_frame = av.VideoFrame.from_ndarray(rgb, format='rgb24')
+        new_frame.pts = pts; pts += 1
+        for pkt in stream.encode(new_frame):
+            out_ctx.mux(pkt)
+    for pkt in stream.encode():
+        out_ctx.mux(pkt)
     out_ctx.close()
 
-    # 2. 解码 HEVC 取 MV / residual
+    # 2. 解码 H.264 取 MV / residual
     in_ctx2 = av.open(str(container_out_path))
     in_ctx2.streams.video[0].codec_context.export_mvs = True
 
@@ -296,20 +314,30 @@ from .saliency_mlp import SaliencyMLP
 
 class Stage1CodecSelector(nn.Module):
     """
-    输入: codec dict + 语言 embedding + ViT (借自 VLM)
+    输入: codec dict + 语言 embedding + dense frames(T 帧全送 ViT)
     输出: 稀疏 RGB patch tokens (B, N_kept, d_p) + saliency 分数 + coords
+
+    架构特点(与 OneVision-Encoder 的关键区别,见 工作文档 §7.2.1):
+      ViT 收到的是 dense T×N_full patches(其母语训练分布),
+      saliency 选择发生在 ViT 输出之后(post-hoc)。这样任意预训练
+      ViT 即用,无需 codec-aware 预训练。
     """
 
     def __init__(self,
-                 vit_encoder: nn.Module,           # 借自 qwen_vl_interface.model.visual
+                 vision_adapter,                   # BaseVisionAdapter:封装 backbone-specific 的 encode/preprocess/freeze
                  d_text: int,
                  keep_ratio: float = 0.20,
-                 grid_size: int = 14):
+                 percentile: float = 0.95):
         super().__init__()
-        self.vit = vit_encoder                     # 已 freeze in framework
+        # adapter 持有 frozen ViT(且 adapter.freeze() 已确保真冻),用 plain attribute
+        # 避免双重注册到 self.parameters。grid_size / d_patch 从 adapter 拿,
+        # 保证 codec parquet / Stage1 / ViT 三方一致(yaml 改一处即一处生效)。
+        object.__setattr__(self, "vision_adapter", vision_adapter)
         self.saliency_mlp = SaliencyMLP(d_text=d_text)
         self.keep_ratio = keep_ratio
-        self.G = grid_size                         # 14
+        self.G = int(vision_adapter.grid_size)
+        self.d_patch = int(vision_adapter.d_patch)
+        self.percentile = float(percentile)
 
     def forward(self, codec: dict, lang_emb: torch.Tensor,
                 frames: torch.Tensor):
@@ -324,25 +352,32 @@ class Stage1CodecSelector(nn.Module):
         device = frames.device
 
         # 1. saliency 评分
-        alpha, beta = self.saliency_mlp(lang_emb)              # (B,1,1,1) 各
-        mv_norm = codec['mv'].float().norm(dim=-1)             # (B,T,G,G)
+        alpha, beta, gamma, v_tgt = self.saliency_mlp(lang_emb)  # (B,) / (B,) / (B,) / (B,2)
+        # 注意:mv.norm 在零向量处反向梯度未定义(NaN),用 (x²+eps).sqrt() 等价稳定形式
+        mv_norm = (codec['mv'].float().pow(2).sum(-1) + 1e-12).sqrt()
+        mv_aligned = (codec['mv'].float() * v_tgt[:, None, None, None, :]).sum(-1)
         residual = codec['residual'].float()
-        s = alpha * mv_norm + beta * residual                  # (B,T,G,G)
+        # _percentile_normalize: per-instance p=0.95 归一化(no_grad denom)
+        s = (alpha[:, None, None, None] * _norm(mv_norm)
+             + gamma[:, None, None, None] * _norm(mv_aligned, signed=True)
+             + beta[:, None, None, None]  * _norm(residual))                      # (B,T,G,G)
 
-        # 2. 全帧过 ViT (复用 VLM 的 vision encoder)
-        with torch.no_grad():
-            patches = self.vit(frames.flatten(0, 1))           # (B*T, G*G, d_p)
+        # 2. 全帧 dense 过 frozen ViT(通过 adapter)
+        # 这是 HTCS 的 dense-in-ViT + 后置选择架构(详见 工作文档 §7.2.1)
+        patches = self.vision_adapter.encode(frames)   # (B, T, G*G, d_patch),内部 no_grad
         d_p = patches.shape[-1]
-        patches = patches.view(B, T, self.G * self.G, d_p)     # (B,T,196,d_p)
 
         # 3. I-frame: 全保留; P-frame: top-ρ
         is_i = codec['is_i_frame']                             # (B,T) bool
         s_flat = s.view(B, T * self.G * self.G)                # (B, T*196)
         patches_flat = patches.view(B, T * self.G * self.G, d_p)
 
-        # 给 I-frame 的 patch 一个 s = +inf 保证全选
+        # 给 I-frame 的 patch 一个**有限的**大 sentinel 保证全选,
+        # 之前用 float('inf') 导致 backward 时 0*inf=NaN 毒化 SaliencyMLP grad(踩过)
         i_mask = is_i.view(B, T, 1, 1).expand(-1, -1, self.G, self.G).reshape(B, -1)
-        s_for_topk = torch.where(i_mask, torch.full_like(s_flat, float('inf')), s_flat)
+        with torch.no_grad():
+            sentinel = s_flat.detach().abs().max() + 1.0
+        s_for_topk = torch.where(i_mask, sentinel.expand_as(s_flat), s_flat)
 
         k_total = int((self.keep_ratio * T + (~is_i[0]).sum() * 0) * self.G * self.G)  # 近似
         # 实际: I-frame 全保留 + P-frame top-ρ%
@@ -448,7 +483,10 @@ class HTCSDefaultConfig:
     stage2: dict = field(default_factory=lambda: {
         "K": 8,
         "n_heads": 4,
-        "d_patch": 1152,                          # SigLIP-Large 输出维度
+        # d_patch 在 HTCS.__init__ 自动从 vision_adapter.d_patch 同步覆盖
+        # (Qwen3.5-0.8B pre-merge=768;SigLIP-Large=1152;Qwen3-VL=1024)。
+        # yaml 写值会被运行时覆盖,所以这个 default 只是 fallback 兜底。
+        "d_patch": 768,
     })
     action_model: dict = field(default_factory=lambda: {
         "action_model_type": "MLP",               # 第一阶段; 后续改 "DiT"
@@ -670,7 +708,10 @@ trainer:
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 3.0e-05
-  freeze_modules: 'qwen_vl_interface.model.visual'   # SigLIP ViT 冻死
+  # vision tower 由 vision_adapter.freeze() 在 framework 内部冻结,
+  # yaml 这一行留空(adapter 走 plain-attribute 持有 ViT,字符串 prefix 模式
+  # 实际冻不到——踩过这个坑导致 ViT grad 爆 NaN)
+  freeze_modules: ''
   max_grad_norm: 1.0
   weight_decay: 0.05
   logging_frequency: 100
@@ -841,18 +882,23 @@ def main():
 
 ## 10. 已知工程陷阱（基于 starVLA 实际行为）
 
-### 10.1 starVLA 的 `freeze_modules` 字段是 dotted prefix
-- `freeze_modules: 'qwen_vl_interface.model.visual'` 会冻所有以这个前缀开头的参数
-- **建议确认方式**：训练启动后看 `auto_get_trainable_modules` 的 log 输出，确认 visual 不在列表里
+### 10.1 ViT 冻结一定要走 `vision_adapter.freeze()`,不能仅靠 yaml `freeze_modules`
+- `freeze_modules: 'xxx.visual'` 是 dotted prefix string match。但 adapter 通过 `object.__setattr__("_vit", ...)` 把 ViT 存为 plain attribute(避免 framework 双重注册),所以 `model.named_parameters()` 走不进 adapter 里的 ViT — yaml prefix 实际**冻不到任何东西**
+- **正确做法**:`BaseVisionAdapter.freeze()` 会同时遍历 `self.parameters()` 和 `self._vit.parameters()`,真正把 ViT 的 requires_grad 关掉
+- 踩过的坑:之前只调 `adapter.freeze()` 但 base 实现只遍历 `self.parameters()`,ViT 没真冻,backward 时通过 VLM 处理当前帧那条路反传到 ViT,bf16 grad 爆炸 → 第一步就 NaN
+- **建议确认方式**:训练启动后看 trainable 参数日志,确认 `qwen_vl_interface.model.model.visual.*` **不在列表里**
 
 ### 10.2 LeRobot 多帧采样的 history_len
 - starVLA 现有 LeRobot loader 的 `history_len` 字段控制采样的过去帧数
 - **HTCS 需要 T=16**——必须与 codec.parquet 里的帧数严格对齐
-- **陷阱**：LeRobot 的 frame_indices 可能含负数（episode 边界），HTCSCodecLoader 要 clamp
+- **陷阱**:LeRobot 的 frame_indices 可能含负数(episode 边界),HTCSCodecLoader 要 clamp
+- **额外踩过的坑**:`LeRobotMixtureDataset.__getitem__` 直接调 `dataset._pack_sample`,**绕过** `LeRobotSingleDataset.__getitem__` 里的 HTCS codec 注入。`libero_all` 走 mixture path,**必须在 mixture 的 getitem 里也插一份 HTCS 注入**,否则 example 里没 `codec` 字段,HTCS forward 报 KeyError
 
-### 10.3 PyAV `export_mvs` 在 libx265 路径
-- ffmpeg 命令行的 `-flags2 +export_mvs` 对 libx265 部分支持，**正确方式是 PyAV 设 `codec_context.export_mvs = True`** + 解码 packet 后从 `frame.side_data` 取
-- HEVC 的 MV 在 16×16 子块上插值——保证输出 14×14 网格与 SigLIP patch grid 对齐
+### 10.3 PyAV `export_mvs` 在 HEVC 路径根本**不工作**
+- ffmpeg/libavcodec 的 `export_mvs` flag 只对 **H.264/MPEG-2/MPEG-4/VP8/VP9** 解码器实现,**不支持 HEVC**
+- 实测:ffprobe 跑 HEVC 视频 110 帧,`Motion vectors` side-data **一个都没有**,只有 SEI_UNREGISTERED;同一段视频转 H.264 后立刻出现 96 个 P-frame 带 MV
+- **正确做法**:codec 选 `libx264`(见 `codec_config.py`),解码端 `codec_context.export_mvs = True` + 解码 packet 后从 `frame.side_data.get(av.sidedata.sidedata.Type.MOTION_VECTORS)` 取(**注意是枚举 key 不是字符串**,字符串静默返回 None 给全零 MV)
+- H.264 的 MV 在 16×16 宏块上;**离线重编码到 224×224 后**,14×14 codec 网格 = 14 cell × 16 px = 224 px,**每个 codec cell 精确对齐一个 H.264 宏块 = 一个 ViT 14×14 patch**
 
 ### 10.4 bf16 + CompetitiveSlotAttention NaN
 - DeepSpeed ZeRO-2 + bf16 下，两次 softmax-normalize 容易 NaN
@@ -878,6 +924,20 @@ def main():
 ### 10.8 Topk 反传到 SaliencyMLP
 - `torch.topk` 不可微，但 saliency_kept 还是有梯度（gather 路径可微）→ SaliencyMLP 能学
 - **诊断**：训练 1K 步后查 `saliency_mlp.net[0].weight.grad.norm()`，应该 > 0
+
+### 10.9 I-frame sentinel **不能用 `float('inf')`**(踩过)
+- 直觉做法是 `torch.where(is_i, +inf, s)`,topk 自然把 I-frame 选光
+- 但 PyTorch autograd **不会短路** `0 * inf = NaN`:下游 min-max normalize 的反传里
+  `d(s_kept_inner[i])/d(denom) = -(topk_vals[i] - min_v)/denom²`,topk_vals=inf 时 = -inf,
+  即便 `torch.where(is_inf, ones, ...)` 把 inf 那一支屏蔽为 0,**inf × 0 = NaN** 仍然进入 grad
+- NaN 流到 saliency map → SaliencyMLP → `clip_grad_norm_` 的全局 norm → 整个 model 367 个 param grad 中毒
+- **正确做法**:用**有限** sentinel `s.detach().abs().max() + 1.0`,数值上仍然是"全选 I-frame"的效果,backward 完全干净
+- 同时 min-max 的 bounds 计算放进 `with torch.no_grad():`,bounds 是统计量不是 gradient signal
+
+### 10.10 `mv_norm = mv.norm(dim=-1)` 在 I-frame 处反传 NaN
+- I-frame 的 MV 全为 0,`||0||_2 = 0`,但 `d(||x||)/d(x_i) = x_i / ||x||` 在零向量处 = 0/0 = NaN
+- **正确写法**:`mv_norm = (mv.pow(2).sum(-1) + 1e-12).sqrt()`,前向 bit-identical(远离零),反向处处可定义
+- 同样的稳定化处理放在 SaliencyMLP 的 `v_tgt` 单位化里
 
 ---
 
