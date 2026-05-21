@@ -227,6 +227,9 @@ temp/*
 
 tmp
 
+# Reference PDFs in docs/htcs/research/refs/ are link-only; keep blobs out of git.
+docs/htcs/research/refs/*.pdf
+
 
 **/*.pt
 **/*.mp4
@@ -247,6 +250,7 @@ tmp
 !docs/starVLA_guideline.md
 !docs/WM4A.md
 !docs/htcs/*.md
+!docs/htcs/research/**/*.md
 
 
 logs/*
